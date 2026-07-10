@@ -15,6 +15,14 @@ import {Pressable, StyleSheet, Text, View} from 'react-native';
 function App(): React.ReactNode {
   const [count, setCount] = useState(0);
 
+  // Startup content signal: fires after the first commit (native views
+  // mounted); the frame presenting them follows within a vsync. Lets the
+  // benchmark verify "Displayed" against actual JS-rendered content
+  // (logcat: [rn-content]).
+  React.useEffect(() => {
+    requestAnimationFrame(() => console.log('[rn-content] first frame'));
+  }, []);
+
   // Stamp on press, log after the next frame commits — mirrors the [native-tap]/
   // [wamr-event]/[valdi-tap] latency logs the other cells emit, so tap->update is
   // measured the same way everywhere (logcat: [rn-tap]).
