@@ -7,12 +7,48 @@
 
 package com.tapcounter
 
+import android.os.Bundle
+import android.view.View
+import android.view.ViewGroup
+import android.view.ViewTreeObserver
 import com.facebook.react.ReactActivity
 import com.facebook.react.ReactActivityDelegate
 import com.facebook.react.defaults.DefaultNewArchitectureEntryPoint.fabricEnabled
 import com.facebook.react.defaults.DefaultReactActivityDelegate
 
 class MainActivity : ReactActivity() {
+
+  override fun onCreate(savedInstanceState: Bundle?) {
+    super.onCreate(savedInstanceState)
+    // Benchmark instrumentation: the uniform [content-frame] startup signal —
+    // the first UI-toolkit draw pass in which the JS-mounted content views
+    // exist (label + button under the ReactRootView), i.e. the frame that
+    // actually renders the counter, not the empty host shell and not a
+    // JS-side commit log. Mirrors the other cells' ContentFrame helper.
+    val decor = window.decorView
+    val content = findViewById<ViewGroup>(android.R.id.content)
+    fun descendants(v: View, budget: Int): Int {
+      var count = 1
+      if (v is ViewGroup) {
+        for (i in 0 until v.childCount) {
+          count += descendants(v.getChildAt(i), budget - count)
+          if (count >= budget) return count
+        }
+      }
+      return count
+    }
+    val listener = object : ViewTreeObserver.OnDrawListener {
+      private var logged = false
+      override fun onDraw() {
+        // content -> ReactRootView -> root View -> label + button (+ text).
+        if (logged || descendants(content, 5) < 5) return
+        logged = true
+        android.util.Log.i("UniversalUI", "[content-frame]")
+        decor.post { decor.viewTreeObserver.removeOnDrawListener(this) }
+      }
+    }
+    decor.viewTreeObserver.addOnDrawListener(listener)
+  }
 
   /**
    * Returns the name of the main component registered from JavaScript. This is used to schedule
