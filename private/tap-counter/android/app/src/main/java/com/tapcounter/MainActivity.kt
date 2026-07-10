@@ -27,21 +27,22 @@ class MainActivity : ReactActivity() {
     // JS-side commit log. Mirrors the other cells' ContentFrame helper.
     val decor = window.decorView
     val content = findViewById<ViewGroup>(android.R.id.content)
-    fun descendants(v: View, budget: Int): Int {
-      var count = 1
+    // LITERAL content check (not a view-count heuristic): the draw pass must
+    // contain a mounted TextView whose text IS the counter label — proof the
+    // frame renders the JS-produced content, not a placeholder shell.
+    fun hasCounterText(v: View): Boolean {
+      if (v is android.widget.TextView && v.text?.startsWith("Tapped") == true) return true
       if (v is ViewGroup) {
         for (i in 0 until v.childCount) {
-          count += descendants(v.getChildAt(i), budget - count)
-          if (count >= budget) return count
+          if (hasCounterText(v.getChildAt(i))) return true
         }
       }
-      return count
+      return false
     }
     val listener = object : ViewTreeObserver.OnDrawListener {
       private var logged = false
       override fun onDraw() {
-        // content -> ReactRootView -> root View -> label + button (+ text).
-        if (logged || descendants(content, 5) < 5) return
+        if (logged || !hasCounterText(content)) return
         logged = true
         android.util.Log.i("UniversalUI", "[content-frame]")
         decor.post { decor.viewTreeObserver.removeOnDrawListener(this) }
