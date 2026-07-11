@@ -41,7 +41,10 @@ function App(): React.ReactNode {
       <Text style={styles.label}>
         Tapped {count} time{count === 1 ? '' : 's'}
       </Text>
-      <Pressable style={styles.button} onPress={onPress}>
+      {/* onAccessibilityTap lets the iOS bench harness drive the SAME
+          native→JS→setState→mount round trip a touch performs, via
+          UIView.accessibilityActivate() (Fabric maps it to this prop). */}
+      <Pressable style={styles.button} onPress={onPress} onAccessibilityTap={onPress}>
         <Text style={styles.buttonText}>Tap me</Text>
       </Pressable>
     </View>
