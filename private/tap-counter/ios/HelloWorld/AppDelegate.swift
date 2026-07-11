@@ -59,19 +59,20 @@ class AppDelegate: UIResponder, UIApplicationDelegate {
 // Documents/bench.json {run, startupMs, launchToContentMs, taps, tapMedianMs,
 // tapMeanMs}.
 //
-// Startup anchor: process start (sysctl p_starttime, dyld included) → the
-// first main-runloop pass whose committed view state contains BOTH the
-// counter label and the button (observer at order 0, ahead of Core
-// Animation's commit observer at 2_000_000).
-//
-// Tap anchor: trigger → detection of the COMPLETE update — the pending
-// window closes only when both the label text AND its frame have changed
-// (the count string changes width, so layout is part of the update; per-tap
-// text+/frame+ provenance is recorded). Detection, not a CATransaction
-// completion: RN mounts on its own scheduler tick, and a completion block
-// attached from the observer can bind to an empty follow-up transaction plus
-// idle-display refresh scheduling — dead wait that isn't framework work (it
-// inflated earlier readings ~2.5x). Trigger phase is randomized to avoid
+// UNIFORM METHODOLOGY (identical to the universal_ui cells' harness):
+// Startup = PROCESS INIT (sysctl p_starttime, dyld included) → the end of
+// the CA commit that first contains BOTH the counter label and the button —
+// laid out and handed off to the render server. Tap = trigger receipt → the
+// end of the CA commit containing the COMPLETE update (both the label text
+// AND its frame changed — the count string changes width, so layout is part
+// of the update). Two runloop observers: order 0 detects the mounted view
+// state ahead of Core Animation's commit observer (order 2,000,000); order
+// 2,500,000 stamps AFTER that same pass's commit — views re-laid-out and
+// SUBMITTED for drawing, the point where it leaves the app's hands. No
+// frame-timing anchors (no display link, no CATransaction completion — that
+// waits on the render server's frame-paced processing). RN's own internal
+// scheduling (main→JS→main hops, Fabric mount ticks) is counted; nothing
+// after the commit handoff is. Trigger phase is randomized to avoid
 // phase-locking to the render tick. The trigger is
 // UIView.accessibilityActivate() on the Pressable, which Fabric maps to the
 // JS onAccessibilityTap prop — the same native→JS→setState→shadow-tree→mount
@@ -104,62 +105,75 @@ final class RNBenchHarness: NSObject {
   private var pendingTurns = 0
   private var tapsRemaining = 15
   private var observer: CFRunLoopObserver?
+  private var postCommitObserver: CFRunLoopObserver?
+  private var contentDetected = false
+  private var updateDetectedFor: CFTimeInterval?
 
   private func start() {
-    // Order 0 runs before CA's commit observer (2_000_000) in the same
-    // before-waiting pass, so a completion block attached here belongs to
-    // the commit that publishes what we just detected.
+    // Order 0: detection, before CA's commit observer (2_000_000) in the
+    // same before-waiting pass — the mutated view state it sees is exactly
+    // what that pass's commit will ship.
     observer = CFRunLoopObserverCreateWithHandler(
       kCFAllocatorDefault, CFRunLoopActivity.beforeWaiting.rawValue, true, 0
     ) { [weak self] _, _ in
       MainActor.assumeIsolated { self?.runLoopTick() }
     }
     CFRunLoopAddObserver(CFRunLoopGetMain(), observer, .commonModes)
+    // Order 2,500,000: after CA's synchronous commit in the same pass — the
+    // frame has been handed off when this fires.
+    postCommitObserver = CFRunLoopObserverCreateWithHandler(
+      kCFAllocatorDefault, CFRunLoopActivity.beforeWaiting.rawValue, true, 2_500_000
+    ) { [weak self] _, _ in
+      MainActor.assumeIsolated { self?.afterCommit() }
+    }
+    CFRunLoopAddObserver(CFRunLoopGetMain(), postCommitObserver, .commonModes)
+  }
+
+  private func afterCommit() {
+    if contentDetected, startupMs == nil {
+      startupMs = Self.msSinceProcessStart()
+      launchToContentMs = (CACurrentMediaTime() - launchedAt) * 1000
+      NSLog("[bench] content commit: startup=%.1fms launch->content=%.1fms",
+            startupMs ?? -1, launchToContentMs ?? -1)
+      DispatchQueue.main.asyncAfter(deadline: .now() + 2.0) { self.tap() }
+      return
+    }
+    guard let t0 = updateDetectedFor else { return }
+    updateDetectedFor = nil
+    taps.append((CACurrentMediaTime() - t0) * 1000)
+    if tapsRemaining > 0 {
+      DispatchQueue.main.asyncAfter(deadline: .now() + 0.9 + Double.random(in: 0...0.1)) { self.tap() }
+    } else {
+      DispatchQueue.main.async { self.finish() }
+    }
   }
 
   private func runLoopTick() {
     guard let window = keyWindow() else { return }
     if startupMs == nil {
+      guard !contentDetected else { return }
       guard findLabelView(in: window) != nil, findButton(in: window) != nil else { return }
-      // Detection anchor: by the time this observer pass sees the mounted
-      // views, the framework's own transaction containing them has been (or
-      // is being) committed this turn; anchoring to a completion block risks
-      // attaching to an empty follow-up transaction (dead wait) when the
-      // mount was committed by the framework's own scheduler tick.
-      startupMs = Self.msSinceProcessStart()
-      launchToContentMs = (CACurrentMediaTime() - launchedAt) * 1000
-      NSLog("[bench] content frame: startup=%.1fms launch->content=%.1fms",
-            startupMs ?? -1, launchToContentMs ?? -1)
-      // Settle, then drive the taps.
-      DispatchQueue.main.asyncAfter(deadline: .now() + 2.0) { self.tap() }
+      // Mounted view state contains the content; this pass's commit ships
+      // it — the post-commit observer stamps startup.
+      contentDetected = true
       return
     }
     guard let t0 = pendingTapStart, let label = findLabelView(in: window) else { return }
     // The pending window closes only when BOTH the label text and its frame
     // have changed — the frame growth ("Tapped 9" → "Tapped 10") is part of
     // the update; a text-only anchor could credit a render whose layout
-    // hasn't landed.
+    // hasn't landed. The post-commit observer stamps at the end of THIS
+    // pass's commit.
     pendingTurns += 1
-    let now = CACurrentMediaTime()
     let text = label.accessibilityLabel ?? ""
-    if pendingTextAt == nil, text != lastLabelText { pendingTextAt = now }
+    if pendingTextAt == nil, text != lastLabelText { pendingTextAt = CACurrentMediaTime() }
     let frame = label.convert(label.bounds, to: nil)
-    if pendingFrameAt == nil, frame != pendingFrame0 { pendingFrameAt = now }
-    if let textAt = pendingTextAt, let frameAt = pendingFrameAt {
+    if pendingFrameAt == nil, frame != pendingFrame0 { pendingFrameAt = CACurrentMediaTime() }
+    if pendingTextAt != nil, pendingFrameAt != nil {
       pendingTapStart = nil
       lastLabelText = text
-      taps.append((max(textAt, frameAt) - t0) * 1000)
-      tapDetails.append(String(format: "text+%.2f frame+%.2f turns=%d",
-                               (textAt - t0) * 1000, (frameAt - t0) * 1000, pendingTurns))
-      if tapsRemaining > 0 {
-        // Randomized trigger phase: a fixed cadence (0.9s = an exact
-        // multiple of the frame period) can phase-lock the trigger to the
-        // framework's render tick and read a constant, unrepresentative
-        // latency. Jitter spreads triggers across the tick period.
-        DispatchQueue.main.asyncAfter(deadline: .now() + 0.9 + Double.random(in: 0...0.1)) { self.tap() }
-      } else {
-        DispatchQueue.main.async { self.finish() }
-      }
+      tapDetails.append(String(format: "turns=%d", pendingTurns))
+      updateDetectedFor = t0
     }
   }
 
@@ -195,6 +209,9 @@ final class RNBenchHarness: NSObject {
 
   private func finish() {
     if let observer { CFRunLoopRemoveObserver(CFRunLoopGetMain(), observer, .commonModes) }
+    if let postCommitObserver {
+      CFRunLoopRemoveObserver(CFRunLoopGetMain(), postCommitObserver, .commonModes)
+    }
     let sorted = taps.sorted()
     let median = sorted.isEmpty ? 0 : sorted[sorted.count / 2]
     let mean = taps.isEmpty ? 0 : taps.reduce(0, +) / Double(taps.count)
