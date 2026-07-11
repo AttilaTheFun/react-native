@@ -60,16 +60,22 @@ class AppDelegate: UIResponder, UIApplicationDelegate {
 // tapMeanMs}.
 //
 // Startup anchor: process start (sysctl p_starttime, dyld included) → the
-// completion of the CA commit that first contains BOTH the counter label and
-// the button — detected by a main-runloop observer (order 0, ahead of Core
-// Animation's commit observer at 2_000_000) scanning the mounted hierarchy,
-// so the CATransaction completion attaches to exactly that commit. Matches
-// the UUI cells' commit-anchored semantics.
+// first main-runloop pass whose committed view state contains BOTH the
+// counter label and the button (observer at order 0, ahead of Core
+// Animation's commit observer at 2_000_000).
 //
-// Tap anchor: trigger → completion of the commit containing the label update.
-// The trigger is UIView.accessibilityActivate() on the Pressable, which
-// Fabric maps to the JS onAccessibilityTap prop — the same native→JS→
-// setState→shadow-tree→mount round trip a real touch performs.
+// Tap anchor: trigger → detection of the COMPLETE update — the pending
+// window closes only when both the label text AND its frame have changed
+// (the count string changes width, so layout is part of the update; per-tap
+// text+/frame+ provenance is recorded). Detection, not a CATransaction
+// completion: RN mounts on its own scheduler tick, and a completion block
+// attached from the observer can bind to an empty follow-up transaction plus
+// idle-display refresh scheduling — dead wait that isn't framework work (it
+// inflated earlier readings ~2.5x). Trigger phase is randomized to avoid
+// phase-locking to the render tick. The trigger is
+// UIView.accessibilityActivate() on the Pressable, which Fabric maps to the
+// JS onAccessibilityTap prop — the same native→JS→setState→shadow-tree→mount
+// round trip a real touch performs.
 @MainActor
 final class RNBenchHarness: NSObject {
   static var shared: RNBenchHarness?
@@ -91,6 +97,11 @@ final class RNBenchHarness: NSObject {
   private var taps: [Double] = []
   private var pendingTapStart: CFTimeInterval?
   private var lastLabelText = ""
+  private var tapDetails: [String] = []
+  private var pendingTextAt: CFTimeInterval?
+  private var pendingFrameAt: CFTimeInterval?
+  private var pendingFrame0 = CGRect.zero
+  private var pendingTurns = 0
   private var tapsRemaining = 15
   private var observer: CFRunLoopObserver?
 
@@ -109,28 +120,45 @@ final class RNBenchHarness: NSObject {
   private func runLoopTick() {
     guard let window = keyWindow() else { return }
     if startupMs == nil {
-      guard let label = findLabel(in: window), findButton(in: window) != nil else { return }
-      lastLabelText = label
-      CATransaction.setCompletionBlock { [self] in
-        startupMs = Self.msSinceProcessStart()
-        launchToContentMs = (CACurrentMediaTime() - launchedAt) * 1000
-        NSLog("[bench] content frame: startup=%.1fms launch->content=%.1fms",
-              startupMs ?? -1, launchToContentMs ?? -1)
-        // Settle, then drive the taps.
-        DispatchQueue.main.asyncAfter(deadline: .now() + 2.0) { self.tap() }
-      }
+      guard findLabelView(in: window) != nil, findButton(in: window) != nil else { return }
+      // Detection anchor: by the time this observer pass sees the mounted
+      // views, the framework's own transaction containing them has been (or
+      // is being) committed this turn; anchoring to a completion block risks
+      // attaching to an empty follow-up transaction (dead wait) when the
+      // mount was committed by the framework's own scheduler tick.
+      startupMs = Self.msSinceProcessStart()
+      launchToContentMs = (CACurrentMediaTime() - launchedAt) * 1000
+      NSLog("[bench] content frame: startup=%.1fms launch->content=%.1fms",
+            startupMs ?? -1, launchToContentMs ?? -1)
+      // Settle, then drive the taps.
+      DispatchQueue.main.asyncAfter(deadline: .now() + 2.0) { self.tap() }
       return
     }
-    if let t0 = pendingTapStart, let label = findLabel(in: window), label != lastLabelText {
-      lastLabelText = label
+    guard let t0 = pendingTapStart, let label = findLabelView(in: window) else { return }
+    // The pending window closes only when BOTH the label text and its frame
+    // have changed — the frame growth ("Tapped 9" → "Tapped 10") is part of
+    // the update; a text-only anchor could credit a render whose layout
+    // hasn't landed.
+    pendingTurns += 1
+    let now = CACurrentMediaTime()
+    let text = label.accessibilityLabel ?? ""
+    if pendingTextAt == nil, text != lastLabelText { pendingTextAt = now }
+    let frame = label.convert(label.bounds, to: nil)
+    if pendingFrameAt == nil, frame != pendingFrame0 { pendingFrameAt = now }
+    if let textAt = pendingTextAt, let frameAt = pendingFrameAt {
       pendingTapStart = nil
-      CATransaction.setCompletionBlock { [self] in
-        taps.append((CACurrentMediaTime() - t0) * 1000)
-        if tapsRemaining > 0 {
-          DispatchQueue.main.asyncAfter(deadline: .now() + 0.9) { self.tap() }
-        } else {
-          finish()
-        }
+      lastLabelText = text
+      taps.append((max(textAt, frameAt) - t0) * 1000)
+      tapDetails.append(String(format: "text+%.2f frame+%.2f turns=%d",
+                               (textAt - t0) * 1000, (frameAt - t0) * 1000, pendingTurns))
+      if tapsRemaining > 0 {
+        // Randomized trigger phase: a fixed cadence (0.9s = an exact
+        // multiple of the frame period) can phase-lock the trigger to the
+        // framework's render tick and read a constant, unrepresentative
+        // latency. Jitter spreads triggers across the tick period.
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.9 + Double.random(in: 0...0.1)) { self.tap() }
+      } else {
+        DispatchQueue.main.async { self.finish() }
       }
     }
   }
@@ -140,16 +168,28 @@ final class RNBenchHarness: NSObject {
       NSLog("[bench] no button to tap"); finish(); return
     }
     tapsRemaining -= 1
+    let label = findLabelView(in: window)
+    lastLabelText = label?.accessibilityLabel ?? ""
+    pendingFrame0 = label.map { $0.convert($0.bounds, to: nil) } ?? .zero
+    pendingTextAt = nil
+    pendingFrameAt = nil
+    pendingTurns = 0
     pendingTapStart = CACurrentMediaTime()
+    let token = pendingTapStart
     if !button.accessibilityActivate() {
       NSLog("[bench] accessibilityActivate not handled")
       pendingTapStart = nil
       finish()
       return
     }
-    // Watchdog: a lost update must not stall the run.
+    // Watchdog: a lost update must not stall the run — skip THIS tap (token
+    // check: only the window it armed) and move on.
     DispatchQueue.main.asyncAfter(deadline: .now() + 3.0) { [self] in
-      if pendingTapStart != nil { pendingTapStart = nil; finish() }
+      if pendingTapStart == token {
+        pendingTapStart = nil
+        tapDetails.append("MISSED (watchdog)")
+        if tapsRemaining > 0 { tap() } else { finish() }
+      }
     }
   }
 
@@ -165,6 +205,7 @@ final class RNBenchHarness: NSObject {
       "taps": taps.map { (($0 * 10).rounded()) / 10 },
       "tapMedianMs": ((median * 10).rounded()) / 10,
       "tapMeanMs": ((mean * 10).rounded()) / 10,
+      "tapDetails": tapDetails,
     ]
     if let data = try? JSONSerialization.data(withJSONObject: payload, options: [.prettyPrinted]),
        let dir = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask).first {
@@ -186,10 +227,10 @@ final class RNBenchHarness: NSObject {
     return nil
   }
 
-  private func findLabel(in view: UIView) -> String? {
-    if let text = view.accessibilityLabel, text.hasPrefix("Tapped ") { return text }
+  private func findLabelView(in view: UIView) -> UIView? {
+    if let text = view.accessibilityLabel, text.hasPrefix("Tapped ") { return view }
     for sub in view.subviews {
-      if let found = findLabel(in: sub) { return found }
+      if let found = findLabelView(in: sub) { return found }
     }
     return nil
   }
