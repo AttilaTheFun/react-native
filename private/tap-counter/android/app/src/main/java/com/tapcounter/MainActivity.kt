@@ -8,6 +8,7 @@
 package com.tapcounter
 
 import android.os.Bundle
+import android.view.MotionEvent
 import android.view.View
 import android.view.ViewGroup
 import android.view.ViewTreeObserver
@@ -18,37 +19,68 @@ import com.facebook.react.defaults.DefaultReactActivityDelegate
 
 class MainActivity : ReactActivity() {
 
+  // Tap-latency instrumentation (native, content-anchored). tapReceiptNs is
+  // stamped when the app receives the tap's ACTION_UP (the event that fires the
+  // click); the OnPreDrawListener stamps the pre-draw pass that first carries
+  // the NEW counter text ("re-laid-out and sent for drawing"). The difference
+  // is the true receipt->content latency and — crucially — it SPANS the async
+  // JS round trip (UI thread -> JS thread -> setState -> Fabric mount), which
+  // the gfxinfo framestats mount-frame anchor misses entirely (that frame's
+  // internal phases don't include the JS hop that precedes it, so it's blind to
+  // JS-thread contention). logcat: [native-tap] latency_us=<n>.
+  @Volatile private var tapReceiptNs = 0L
+  private var lastCounter: String? = null
+
+  override fun dispatchTouchEvent(ev: MotionEvent): Boolean {
+    if (ev.actionMasked == MotionEvent.ACTION_UP) tapReceiptNs = System.nanoTime()
+    return super.dispatchTouchEvent(ev)
+  }
+
   override fun onCreate(savedInstanceState: Bundle?) {
     super.onCreate(savedInstanceState)
-    // Benchmark instrumentation: the uniform [content-frame] startup signal —
-    // the first UI-toolkit draw pass in which the JS-mounted content views
-    // exist (label + button under the ReactRootView), i.e. the frame that
-    // actually renders the counter, not the empty host shell and not a
-    // JS-side commit log. Mirrors the other cells' ContentFrame helper.
     val decor = window.decorView
     val content = findViewById<ViewGroup>(android.R.id.content)
-    // LITERAL content check (not a view-count heuristic): the draw pass must
-    // contain a mounted TextView whose text IS the counter label — proof the
-    // frame renders the JS-produced content, not a placeholder shell.
-    fun hasCounterText(v: View): Boolean {
-      if (v is android.widget.TextView && v.text?.startsWith("Tapped") == true) return true
+    // The mounted counter label's current string ("Tapped N time(s)"), or null
+    // if the JS content isn't mounted yet. A literal content check, not a
+    // view-count heuristic — proof the frame renders the JS-produced content.
+    fun counterText(v: View): String? {
+      if (v is android.widget.TextView && v.text?.startsWith("Tapped") == true) return v.text.toString()
       if (v is ViewGroup) {
         for (i in 0 until v.childCount) {
-          if (hasCounterText(v.getChildAt(i))) return true
+          val r = counterText(v.getChildAt(i))
+          if (r != null) return r
         }
       }
-      return false
+      return null
     }
-    val listener = object : ViewTreeObserver.OnDrawListener {
+    // Startup signal [content-frame]: the first draw pass in which the counter
+    // label + button exist (the frame that renders the counter, not the empty
+    // host shell and not a JS-side commit log). Mirrors the other cells.
+    val startupListener = object : ViewTreeObserver.OnDrawListener {
       private var logged = false
       override fun onDraw() {
-        if (logged || !hasCounterText(content)) return
+        if (logged || counterText(content) == null) return
         logged = true
         android.util.Log.i("UniversalUI", "[content-frame]")
         decor.post { decor.viewTreeObserver.removeOnDrawListener(this) }
       }
     }
-    decor.viewTreeObserver.addOnDrawListener(listener)
+    decor.viewTreeObserver.addOnDrawListener(startupListener)
+    // Tap signal [native-tap]: the pre-draw pass that first shows a NEW count
+    // string. The first sighting (startup "Tapped 0 times") only seeds
+    // lastCounter; every later change is tap-driven, so we log receipt->here.
+    content.viewTreeObserver.addOnPreDrawListener {
+      val cur = counterText(content)
+      if (cur != null && cur != lastCounter) {
+        val r = tapReceiptNs
+        if (lastCounter != null && r != 0L) {
+          android.util.Log.i("UniversalUI", "[native-tap] latency_us=${(System.nanoTime() - r) / 1000}")
+          tapReceiptNs = 0L
+        }
+        lastCounter = cur
+      }
+      true
+    }
   }
 
   /**
