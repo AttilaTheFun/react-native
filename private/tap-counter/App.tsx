@@ -9,11 +9,38 @@
  */
 
 import * as React from 'react';
-import {useState} from 'react';
+import {useEffect, useState} from 'react';
 import {Pressable, StyleSheet, Text, View} from 'react-native';
 
-function App(): React.ReactNode {
+// The "real world" benchmark mode (initialProperties {busy: true}, set by the
+// native harness from UUI_BUSY=1): a synthetic ~25%-duty load on the JS
+// thread — every 16 ms a ~4 ms chunk of object churn + JSON round-trips, the
+// shape of a feed diffing / payload parsing in the background — that taps
+// must compete with. The identical load runs in the Valdi twin
+// (TapCounterBusy.tsx) so the busy-thread comparison is apples-to-apples.
+function startBusyLoop() {
+  setInterval(() => {
+    const t0 = Date.now();
+    let acc = 0;
+    while (Date.now() - t0 < 4) {
+      const arr = [];
+      for (let i = 0; i < 100; i++) {
+        arr.push({i, s: 'item-' + i, v: Math.sqrt(i)});
+      }
+      acc += JSON.parse(JSON.stringify(arr)).length;
+    }
+    return acc;
+  }, 16);
+}
+
+function App(props: {busy?: boolean}): React.ReactNode {
   const [count, setCount] = useState(0);
+
+  useEffect(() => {
+    if (props.busy) {
+      startBusyLoop();
+    }
+  }, [props.busy]);
 
   // Startup content signal: fires after the first commit (native views
   // mounted); the frame presenting them follows within a vsync. Lets the

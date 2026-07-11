@@ -62,5 +62,10 @@ class MainActivity : ReactActivity() {
    * which allows you to enable New Architecture with a single boolean flags [fabricEnabled]
    */
   override fun createReactActivityDelegate(): ReactActivityDelegate =
-      DefaultReactActivityDelegate(this, mainComponentName, fabricEnabled)
+      object : DefaultReactActivityDelegate(this, mainComponentName, fabricEnabled) {
+        // The "real world" bench mode: `--ez busy true` starts a synthetic
+        // JS-thread load the taps must compete with (see App.tsx).
+        override fun getLaunchOptions(): Bundle =
+            Bundle().apply { putBoolean("busy", intent?.getBooleanExtra("busy", false) ?: false) }
+      }
 }

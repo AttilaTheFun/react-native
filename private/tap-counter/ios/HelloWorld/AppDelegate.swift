@@ -42,6 +42,11 @@ class AppDelegate: UIResponder, UIApplicationDelegate {
     factory.startReactNative(
       withModuleName: "TapCounter",
       in: window,
+      initialProperties: [
+        // The "real world" bench mode: UUI_BUSY=1 starts a synthetic JS-thread
+        // load the taps must compete with (see App.tsx).
+        "busy": ProcessInfo.processInfo.environment["UUI_BUSY"] == "1"
+      ],
       launchOptions: launchOptions
     )
 
@@ -135,14 +140,14 @@ final class RNBenchHarness: NSObject {
       launchToContentMs = (CACurrentMediaTime() - launchedAt) * 1000
       NSLog("[bench] content commit: startup=%.1fms launch->content=%.1fms",
             startupMs ?? -1, launchToContentMs ?? -1)
-      DispatchQueue.main.asyncAfter(deadline: .now() + 2.0) { self.tap() }
+      DispatchQueue.main.asyncAfter(deadline: .now() + 1.0) { self.tap() }
       return
     }
     guard let t0 = updateDetectedFor else { return }
     updateDetectedFor = nil
     taps.append((CACurrentMediaTime() - t0) * 1000)
     if tapsRemaining > 0 {
-      DispatchQueue.main.asyncAfter(deadline: .now() + 0.9 + Double.random(in: 0...0.1)) { self.tap() }
+      DispatchQueue.main.asyncAfter(deadline: .now() + 0.25 + Double.random(in: 0...0.05)) { self.tap() }
     } else {
       DispatchQueue.main.async { self.finish() }
     }
@@ -198,7 +203,7 @@ final class RNBenchHarness: NSObject {
     }
     // Watchdog: a lost update must not stall the run — skip THIS tap (token
     // check: only the window it armed) and move on.
-    DispatchQueue.main.asyncAfter(deadline: .now() + 3.0) { [self] in
+    DispatchQueue.main.asyncAfter(deadline: .now() + 2.0) { [self] in
       if pendingTapStart == token {
         pendingTapStart = nil
         tapDetails.append("MISSED (watchdog)")
