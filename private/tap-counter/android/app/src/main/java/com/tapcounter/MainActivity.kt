@@ -30,9 +30,31 @@ class MainActivity : ReactActivity() {
   // JS-thread contention). logcat: [native-tap] latency_us=<n>.
   @Volatile private var tapReceiptNs = 0L
   private var lastCounter: String? = null
+  private var downX = 0f
+  private var downY = 0f
+  private var downAtMs = 0L
+  private var traceOpen = false
 
   override fun dispatchTouchEvent(ev: MotionEvent): Boolean {
-    if (ev.actionMasked == MotionEvent.ACTION_UP) tapReceiptNs = System.nanoTime()
+    when (ev.actionMasked) {
+      MotionEvent.ACTION_DOWN -> {
+        downX = ev.x; downY = ev.y
+        downAtMs = android.os.SystemClock.uptimeMillis()
+      }
+      MotionEvent.ACTION_UP -> {
+        // Macrobenchmark's TraceSectionMetric reads "uui-tap": open it only
+        // for real TAPS (small travel, short hold) - a swipe's ACTION_UP must
+        // not dangle a phantom section.
+        val slop = android.view.ViewConfiguration.get(this).scaledTouchSlop
+        val dx = ev.x - downX; val dy = ev.y - downY
+        val held = android.os.SystemClock.uptimeMillis() - downAtMs
+        if (dx * dx + dy * dy <= slop.toFloat() * slop && held < 300) {
+          tapReceiptNs = System.nanoTime()
+          android.os.Trace.beginAsyncSection("uui-tap", 0)
+          traceOpen = true
+        }
+      }
+    }
     return super.dispatchTouchEvent(ev)
   }
 
@@ -75,6 +97,10 @@ class MainActivity : ReactActivity() {
         val r = tapReceiptNs
         if (lastCounter != null && r != 0L) {
           android.util.Log.i("UniversalUI", "[native-tap] latency_us=${(System.nanoTime() - r) / 1000}")
+          if (traceOpen) {
+            android.os.Trace.endAsyncSection("uui-tap", 0)
+            traceOpen = false
+          }
           tapReceiptNs = 0L
         }
         lastCounter = cur

@@ -9,6 +9,7 @@ import React
 import ReactAppDependencyProvider
 import React_RCTAppDelegate
 import UIKit
+import os.signpost
 
 @main
 class AppDelegate: UIResponder, UIApplicationDelegate {
@@ -51,6 +52,7 @@ class AppDelegate: UIResponder, UIApplicationDelegate {
     )
 
     RNBenchHarness.installIfRequested()
+    RNBenchHarness.installSignpostIfRequested()
 
     return true
   }
@@ -85,6 +87,46 @@ class AppDelegate: UIResponder, UIApplicationDelegate {
 @MainActor
 final class RNBenchHarness: NSObject {
   static var shared: RNBenchHarness?
+
+  // Signpost mode (the XCUITest interaction benchmark): REAL touches drive
+  // the app; an os_signpost interval "tap" (dev.universalui.bench /
+  // Interaction) opens at UIEvent receipt (UIWindow.sendEvent swizzle) and
+  // closes at the commit that ships the detected label update - the same
+  // interval the first-party cells emit, read by XCTOSSignpostMetric.
+  static let signpostLog = OSLog(subsystem: "dev.universalui.bench", category: "Interaction")
+  private var signpostMode = false
+  private var signpostID: OSSignpostID?
+
+  static func installSignpostIfRequested() {
+    guard ProcessInfo.processInfo.environment["UUI_BENCH_SIGNPOST"] == "1"
+      || ProcessInfo.processInfo.arguments.contains("-bench-signpost") else { return }
+    let harness = RNBenchHarness()
+    shared = harness
+    harness.signpostMode = true
+    harness.startupMs = -1  // skip the startup/auto-tap flow; detection only
+    harness.start()
+    RNTouchProbeWindow.swizzleSendEvent()
+    NSLog("[bench] RN interaction signpost armed")
+  }
+
+  /// Real-touch receipt (touch .ended anywhere): arm detection + open the
+  /// signpost. The detection window then behaves exactly like tap().
+  func realTouchEnded() {
+    guard signpostMode, let window = keyWindow() else { return }
+    let label = findLabelView(in: window)
+    lastLabelText = label?.accessibilityLabel ?? ""
+    pendingFrame0 = label.map { $0.convert($0.bounds, to: nil) } ?? .zero
+    pendingTextAt = nil
+    pendingFrameAt = nil
+    pendingTurns = 0
+    if let open = signpostID {
+      os_signpost(.end, log: Self.signpostLog, name: "tap", signpostID: open)
+    }
+    let id = OSSignpostID(log: Self.signpostLog)
+    signpostID = id
+    os_signpost(.begin, log: Self.signpostLog, name: "tap", signpostID: id)
+    pendingTapStart = CACurrentMediaTime()
+  }
 
   static func installIfRequested() {
     guard ProcessInfo.processInfo.environment["UUI_BENCH"] == "1" else { return }
@@ -145,6 +187,13 @@ final class RNBenchHarness: NSObject {
     }
     guard let t0 = updateDetectedFor else { return }
     updateDetectedFor = nil
+    if signpostMode {
+      if let id = signpostID {
+        os_signpost(.end, log: Self.signpostLog, name: "tap", signpostID: id)
+        signpostID = nil
+      }
+      return
+    }
     taps.append((CACurrentMediaTime() - t0) * 1000)
     if tapsRemaining > 0 {
       DispatchQueue.main.asyncAfter(deadline: .now() + 0.25 + Double.random(in: 0...0.05)) { self.tap() }
@@ -292,5 +341,32 @@ class ReactNativeDelegate: RCTDefaultReactNativeFactoryDelegate {
     #else
     Bundle.main.url(forResource: "main", withExtension: "jsbundle")
     #endif
+  }
+}
+
+
+/// Bench-only UIWindow sendEvent hook: notifies the harness of every touch
+/// .ended so real XCUITest taps open the signpost interval at UIEvent
+/// receipt. Swizzled only in signpost mode.
+private var rnSendEventSwizzled = false
+enum RNTouchProbeWindow {
+  static func swizzleSendEvent() {
+    guard !rnSendEventSwizzled else { return }
+    rnSendEventSwizzled = true
+    guard let original = class_getInstanceMethod(UIWindow.self, #selector(UIWindow.sendEvent(_:))),
+          let hook = class_getInstanceMethod(UIWindow.self, #selector(UIWindow.rnbench_sendEvent(_:)))
+    else { return }
+    method_exchangeImplementations(original, hook)
+  }
+}
+
+extension UIWindow {
+  @objc func rnbench_sendEvent(_ event: UIEvent) {
+    if event.type == .touches,
+       let touches = event.allTouches,
+       touches.contains(where: { $0.phase == .ended }) {
+      MainActor.assumeIsolated { RNBenchHarness.shared?.realTouchEnded() }
+    }
+    self.rnbench_sendEvent(event)  // swizzled: calls the original
   }
 }
